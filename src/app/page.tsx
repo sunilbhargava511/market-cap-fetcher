@@ -1,14 +1,9 @@
-import MarketCapForm from '../components/MarketCapForm';
-
-export const metadata = {
-  title: 'Enhanced Market Cap Fetcher',
-  description: 'Fetch historical market cap data for multiple tickers across multiple years',
-};
+import MarketCapForm from '@/components/MarketCapForm';
 
 export default function Home() {
   return (
-    <div className="min-h-screen bg-gray-50">
+    <main className="min-h-screen bg-gray-50 py-8">
       <MarketCapForm />
-    </div>
+    </main>
   );
 }
