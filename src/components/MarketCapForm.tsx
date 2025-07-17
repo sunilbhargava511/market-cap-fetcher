@@ -77,156 +77,161 @@ const MarketCapForm: React.FC = () => {
   // File upload handler
   const handleFileUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (file && file.type === 'text/csv') {
+    if (file) {
       setCsvFile(file);
-      
       const reader = new FileReader();
       reader.onload = (e) => {
-        const csvText = e.target?.result as string;
-        const lines = csvText.split('\n');
-        const headers = lines[0].split(',').map(h => h.trim());
-        
-        if (lines.length > 1) {
-          const dataRow = lines[1].split(',');
-          const newDates: StartOfYearDates = {};
-          
-          headers.slice(1).forEach((year, index) => {
-            if (dataRow[index + 1] && dataRow[index + 1].trim()) {
-              newDates[year.trim()] = dataRow[index + 1].trim();
-            }
-          });
-          
-          setStartOfYearDates(prev => ({ ...prev, ...newDates }));
+        const text = e.target?.result as string;
+        if (text) {
+          parseTickersFromCsv(text);
         }
       };
       reader.readAsText(file);
     }
   }, []);
 
-  // Create pause promise
-  const pausePromise = useCallback(() => {
-    if (!isPaused) return Promise.resolve();
+  // Parse tickers from CSV
+  const parseTickersFromCsv = (csvText: string) => {
+    const lines = csvText.split('\n');
+    const tickerSet = new Set<string>();
     
-    return new Promise<void>((resolve) => {
-      pauseResolveRef.current = resolve;
-    });
-  }, [isPaused]);
-
-  // Fetch market cap data
-  const fetchMarketCap = async (
-    ticker: string, 
-    date: string, 
-    retries: number = 3
-  ): Promise<{ success: boolean; data?: any; error?: string }> => {
-    const urls = [
-      `${apiBaseUrl}/api/market-cap?ticker=${ticker}&date=${date}`
-    ];
-
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      for (const url of urls) {
-        try {
-          const response = await fetch(url, {
-            signal: abortControllerRef.current?.signal
-          });
-          
-          if (response.ok) {
-            const data = await response.json();
-            return { success: true, data };
-          }
-        } catch (error) {
-          if (error instanceof Error && error.name === 'AbortError') {
-            throw error;
-          }
-          // Continue to next URL/attempt
+    for (const line of lines) {
+      const values = line.split(',').map(v => v.trim().replace(/"/g, ''));
+      for (const value of values) {
+        if (value && value.length > 0 && value !== 'ticker') {
+          tickerSet.add(value.toUpperCase());
         }
-      }
-      
-      if (attempt < retries) {
-        await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
       }
     }
     
-    return { success: false, error: 'All fetch attempts failed' };
+    const extractedTickers = Array.from(tickerSet).join(' ');
+    setTickers(extractedTickers);
   };
 
-  // Main fetch function
-  const handleFetch = async () => {
-    const tickerList = tickers.split(/\s+/).filter(t => t.trim());
-    
-    if (tickerList.length === 0) {
-      alert('Please enter at least one ticker symbol');
+  // Wait for pause/resume
+  const waitForResume = (): Promise<void> => {
+    return new Promise((resolve) => {
+      if (!isPaused) {
+        resolve();
+        return;
+      }
+      pauseResolveRef.current = resolve;
+    });
+  };
+
+  // Sleep function
+  const sleep = (ms: number): Promise<void> => {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  };
+
+  // Process data
+  const processData = async () => {
+    if (!tickers.trim()) {
+      alert('Please enter at least one ticker');
       return;
     }
 
-    const years = Array.from({ length: endYear - startYear + 1 }, (_, i) => startYear + i);
-    const totalRequests = tickerList.length * years.length;
-
-    setIsLoading(true);
-    setIsPaused(false);
+    // Reset state
     setResults([]);
     setErrors([]);
-    setProgress({ completed: 0, total: totalRequests, failed: 0 });
+    setIsLoading(true);
+    setIsPaused(false);
 
-    // Create new abort controller
+    // Create abort controller
     abortControllerRef.current = new AbortController();
 
-    const newResults: MarketCapData[] = [];
-    const newErrors: ErrorData[] = [];
+    // Parse tickers and years
+    const tickerList = tickers.trim().split(/\s+/).map(t => t.toUpperCase());
+    const years = Array.from(
+      { length: endYear - startYear + 1 }, 
+      (_, i) => startYear + i
+    );
+
+    const totalRequests = tickerList.length * years.length;
+    
+    setProgress({
+      completed: 0,
+      total: totalRequests,
+      failed: 0
+    });
+
+    const allResults: MarketCapData[] = [];
+    const allErrors: ErrorData[] = [];
     let completed = 0;
     let failed = 0;
 
     try {
       for (const ticker of tickerList) {
         for (const year of years) {
-          // Check for abort
+          // Check if aborted
           if (abortControllerRef.current?.signal.aborted) {
+            console.log('Fetch aborted');
             return;
           }
 
-          // Handle pause
-          await pausePromise();
+          // Wait for resume if paused
+          await waitForResume();
 
           const date = startOfYearDates[year.toString()] || `${year}-01-02`;
 
           try {
-            const result = await fetchMarketCap(ticker, date);
-            
-            if (result.success && result.data) {
-              newResults.push({
-                ticker: result.data.ticker || ticker,
-                year: year.toString(),
-                date: result.data.date || date,
-                price: result.data.price || 0,
-                adjusted_price: result.data.adjusted_price || result.data.price || 0,
-                shares_outstanding: result.data.shares_outstanding || 0,
-                market_cap: result.data.market_cap || 0,
-                market_cap_billions: result.data.market_cap_billions || 0,
-                formatted_market_cap: result.data.formatted_market_cap || '',
-                price_adjustment_note: result.data.price_adjustment_note
-              });
-              completed++;
-            } else {
-              newErrors.push({ ticker, year: year.toString(), date, error: result.error || 'Unknown error' });
-              failed++;
+            const response = await fetch(`${apiBaseUrl}/api/market-cap`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ticker, date }),
+              signal: abortControllerRef.current?.signal
+            });
+
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
-          } catch (error) {
-            if (error instanceof Error && error.name === 'AbortError') {
+
+            const data = await response.json();
+            
+            if (data.error) {
+              allErrors.push({
+                ticker,
+                year: year.toString(),
+                date,
+                error: data.error
+              });
+              failed++;
+            } else {
+              allResults.push({
+                ...data,
+                year: year.toString()
+              });
+            }
+
+          } catch (error: any) {
+            if (error.name === 'AbortError') {
+              console.log('Request aborted');
               return;
             }
-            const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-            newErrors.push({ ticker, year: year.toString(), date, error: errorMessage });
+            
+            allErrors.push({
+              ticker,
+              year: year.toString(),
+              date,
+              error: error.message || 'Unknown error'
+            });
             failed++;
           }
 
+          completed++;
           setProgress({ completed, total: totalRequests, failed });
-          setResults([...newResults]);
-          setErrors([...newErrors]);
+          setResults([...allResults]);
+          setErrors([...allErrors]);
 
-          // Add delay between requests
+          // Add delay to avoid rate limiting
           if (delay > 0) {
-            await new Promise(resolve => setTimeout(resolve, delay));
+            await sleep(delay);
           }
         }
+      }
+    } catch (error: any) {
+      if (error.name !== 'AbortError') {
+        console.error('Processing error:', error);
       }
     } finally {
       setIsLoading(false);
@@ -234,136 +239,150 @@ const MarketCapForm: React.FC = () => {
     }
   };
 
-  // Control functions
+  // Pause/Resume handlers
   const handlePause = () => {
     setIsPaused(true);
   };
 
   const handleResume = () => {
     setIsPaused(false);
-    pauseResolveRef.current?.();
-    pauseResolveRef.current = null;
-  };
-
-  const handleStop = () => {
-    abortControllerRef.current?.abort();
-    setIsLoading(false);
-    setIsPaused(false);
-    pauseResolveRef.current?.();
-    pauseResolveRef.current = null;
-  };
-
-  // Utility functions
-  const getSelectedYears = () => {
-    return Array.from({ length: endYear - startYear + 1 }, (_, i) => (startYear + i).toString());
-  };
-
-  const downloadCsv = (data: (string | number)[][], filename: string) => {
-    const csvContent = data.map(row => 
-      row.map(cell => 
-        typeof cell === 'string' && (cell.includes(',') || cell.includes('"') || cell.includes('\n'))
-          ? `"${cell.replace(/"/g, '""')}"` 
-          : cell
-      ).join(',')
-    ).join('\n');
-    
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    if (link.download !== undefined) {
-      const url = URL.createObjectURL(blob);
-      link.setAttribute('href', url);
-      link.setAttribute('download', filename);
-      link.style.visibility = 'hidden';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+    if (pauseResolveRef.current) {
+      pauseResolveRef.current();
+      pauseResolveRef.current = null;
     }
   };
 
+  // Stop handler
+  const handleStop = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    setIsLoading(false);
+    setIsPaused(false);
+    if (pauseResolveRef.current) {
+      pauseResolveRef.current();
+      pauseResolveRef.current = null;
+    }
+  };
+
+  // Get selected years for export
+  const getSelectedYears = () => {
+    return Array.from(
+      { length: endYear - startYear + 1 }, 
+      (_, i) => (startYear + i).toString()
+    );
+  };
+
+  // Create pivot data helper
   const createPivotData = (results: MarketCapData[], field: keyof MarketCapData) => {
     const selectedYears = getSelectedYears();
-    const tickerList = [...new Set(results.map(r => r.ticker?.replace('.US', '')))].sort();
-    
+    // FIXED LINE: Use Array.from() instead of spread operator
+    const tickerList = Array.from(new Set(results.map(r => r.ticker?.replace('.US', '')))).sort();
+
     // Create header row
     const headers = ['Ticker', ...selectedYears];
-    
+
     // Create data rows
     const rows = tickerList.map(ticker => {
-      const row: (string | number)[] = [ticker];
-      selectedYears.forEach(year => {
+      const row = [ticker];
+      for (const year of selectedYears) {
         const result = results.find(r => 
           r.ticker?.replace('.US', '') === ticker && r.year === year
         );
-        // Use adjusted_price for price exports, otherwise use the requested field
-        const value = result ? (field === 'price' ? result.adjusted_price || result[field] : result[field]) : '';
-        row.push(value || '');
-      });
+        const value = result?.[field];
+        row.push(value !== undefined ? value.toString() : '');
+      }
       return row;
     });
-    
+
     return [headers, ...rows];
   };
 
-  // CSV export functions
+  // CSV Export Functions
   const exportPricesCsv = () => {
-    if (results.length === 0) return;
-    const data = createPivotData(results, 'price');
-    downloadCsv(data, `split_adjusted_prices_${startYear}_${endYear}_${new Date().toISOString().split('T')[0]}.csv`);
+    const csvData = createPivotData(results, 'adjusted_price');
+    const csvContent = csvData.map(row => row.join(',')).join('\n');
+    downloadCsv(csvContent, 'market_cap_prices.csv');
   };
 
   const exportMarketCapCsv = () => {
-    if (results.length === 0) return;
-    const data = createPivotData(results, 'market_cap_billions');
-    downloadCsv(data, `market_cap_billions_${startYear}_${endYear}_${new Date().toISOString().split('T')[0]}.csv`);
+    const csvData = createPivotData(results, 'market_cap_billions');
+    const csvContent = csvData.map(row => row.join(',')).join('\n');
+    downloadCsv(csvContent, 'market_cap_values.csv');
   };
 
   const exportSharesCsv = () => {
-    if (results.length === 0) return;
-    const data = createPivotData(results, 'shares_outstanding');
-    downloadCsv(data, `shares_outstanding_${startYear}_${endYear}_${new Date().toISOString().split('T')[0]}.csv`);
-  };
-
-  const exportErrorsCsv = () => {
-    if (errors.length === 0) return;
-    const data = [
-      ['Ticker', 'Year', 'Date', 'Error'],
-      ...errors.map(error => [error.ticker, error.year, error.date, error.error])
-    ];
-    downloadCsv(data, `errors_${startYear}_${endYear}_${new Date().toISOString().split('T')[0]}.csv`);
+    const csvData = createPivotData(results, 'shares_outstanding');
+    const csvContent = csvData.map(row => row.join(',')).join('\n');
+    downloadCsv(csvContent, 'shares_outstanding.csv');
   };
 
   const exportRawDataCsv = () => {
     if (results.length === 0) return;
-    const data = [
-      ['Ticker', 'Year', 'Date', 'Raw_Price', 'Adjusted_Price', 'Shares_Outstanding', 'Market_Cap', 'Market_Cap_Billions', 'Price_Adjustment_Note'],
+    
+    const headers = ['ticker', 'year', 'date', 'price', 'adjusted_price', 'shares_outstanding', 'market_cap', 'market_cap_billions'];
+    const csvContent = [
+      headers.join(','),
       ...results.map(result => [
-        result.ticker?.replace('.US', '') || '',
+        result.ticker || '',
         result.year || '',
         result.date || '',
         result.price || '',
         result.adjusted_price || '',
         result.shares_outstanding || '',
         result.market_cap || '',
-        result.market_cap_billions || '',
-        result.price_adjustment_note || ''
-      ])
-    ];
-    downloadCsv(data, `raw_data_${startYear}_${endYear}_${new Date().toISOString().split('T')[0]}.csv`);
+        result.market_cap_billions || ''
+      ].join(','))
+    ].join('\n');
+    
+    downloadCsv(csvContent, 'market_cap_raw_data.csv');
+  };
+
+  const exportErrorsCsv = () => {
+    if (errors.length === 0) return;
+    
+    const headers = ['ticker', 'year', 'date', 'error'];
+    const csvContent = [
+      headers.join(','),
+      ...errors.map(error => [
+        error.ticker,
+        error.year,
+        error.date,
+        `"${error.error}"`
+      ].join(','))
+    ].join('\n');
+    
+    downloadCsv(csvContent, 'market_cap_errors.csv');
+  };
+
+  const downloadCsv = (content: string, filename: string) => {
+    const blob = new Blob([content], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
   };
 
   return (
-    <div className="max-w-6xl mx-auto p-6 bg-white">
-      <div className="mb-8">
+    <div className="max-w-6xl mx-auto p-4 space-y-6">
+      {/* Header */}
+      <div className="bg-white border border-gray-200 rounded-lg p-6">
         <h1 className="text-3xl font-bold text-gray-900 mb-2">Enhanced Market Cap Fetcher</h1>
-        <p className="text-gray-600">
-          Fetch split-adjusted historical market capitalization data using EODHD API
+        <p className="text-gray-600 mb-4">
+          Fetch historical market cap data for multiple tickers across multiple years using split-adjusted prices.
         </p>
-        <div className="mt-3 p-4 bg-blue-50 rounded-lg">
-          <div className="flex items-start gap-2">
+        
+        {/* Info Box */}
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+          <div className="flex items-start gap-3">
             <Info className="h-5 w-5 text-blue-600 mt-0.5 flex-shrink-0" />
-            <div className="text-sm text-blue-800">
-              <p className="font-medium mb-1">Enhanced with Split-Adjusted Pricing:</p>
-              <ul className="list-disc list-inside space-y-1 text-blue-700">
+            <div>
+              <h3 className="font-medium text-blue-900 mb-2">How It Works</h3>
+              <ul className="text-sm list-disc list-inside space-y-1 text-blue-700">
                 <li>Uses <strong>adjusted_close</strong> prices from EODHD API for accurate historical data</li>
                 <li>Attempts to fetch historical shares outstanding for specific time periods</li>
                 <li>Market cap = split-adjusted price × historical shares outstanding</li>
@@ -437,100 +456,84 @@ const MarketCapForm: React.FC = () => {
               disabled={isLoading}
             />
             <p className="text-xs text-gray-500 mt-1">
-              Recommended: 100ms for EODHD API rate limiting
+              Recommended: 100ms (free tier), 50ms (paid tier)
             </p>
           </div>
         </div>
 
-        {/* Right Column - CSV Upload & Start Dates */}
+        {/* Right Column - CSV Upload & Controls */}
         <div className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">
-              Upload Start-of-Year Dates CSV (Optional)
+              Or Upload CSV File
             </label>
-            <div className="border-2 border-dashed border-gray-300 rounded-lg p-4">
-              <div className="text-center">
-                <Upload className="mx-auto h-8 w-8 text-gray-400" />
-                <input
-                  type="file"
-                  accept=".csv"
-                  onChange={handleFileUpload}
-                  className="mt-2 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
-                  disabled={isLoading}
-                />
-                {csvFile && (
-                  <p className="text-sm text-green-600 mt-2">
-                    ✓ Uploaded: {csvFile.name}
-                  </p>
-                )}
-              </div>
+            <div className="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center hover:border-gray-400 transition-colors">
+              <input
+                type="file"
+                accept=".csv"
+                onChange={handleFileUpload}
+                className="hidden"
+                id="csv-upload"
+                disabled={isLoading}
+              />
+              <label
+                htmlFor="csv-upload"
+                className="cursor-pointer flex flex-col items-center gap-2"
+              >
+                <Upload className="h-8 w-8 text-gray-400" />
+                <span className="text-sm text-gray-600">
+                  {csvFile ? csvFile.name : 'Click to upload ticker CSV'}
+                </span>
+              </label>
             </div>
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              Current Start-of-Year Trading Dates
-            </label>
-            <div className="bg-gray-50 p-3 rounded-md max-h-40 overflow-y-auto">
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                {Object.entries(startOfYearDates)
-                  .filter(([year]) => parseInt(year) >= startYear && parseInt(year) <= endYear)
-                  .map(([year, date]) => (
-                    <div key={year} className="flex justify-between">
-                      <span className="font-medium">{year}:</span>
-                      <span className="text-gray-600">{date}</span>
-                    </div>
-                  ))}
+          {/* Action Buttons */}
+          <div className="space-y-3">
+            {!isLoading ? (
+              <button
+                onClick={processData}
+                className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 font-medium"
+              >
+                <Play className="h-4 w-4" />
+                Start Fetching Market Cap Data
+              </button>
+            ) : (
+              <div className="flex gap-2">
+                {!isPaused ? (
+                  <button
+                    onClick={handlePause}
+                    className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-yellow-600 text-white rounded-md hover:bg-yellow-700 font-medium"
+                  >
+                    <Pause className="h-4 w-4" />
+                    Pause
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleResume}
+                    className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-green-600 text-white rounded-md hover:bg-green-700 font-medium"
+                  >
+                    <Play className="h-4 w-4" />
+                    Resume
+                  </button>
+                )}
+                <button
+                  onClick={handleStop}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-red-600 text-white rounded-md hover:bg-red-700 font-medium"
+                >
+                  <Square className="h-4 w-4" />
+                  Stop
+                </button>
               </div>
-            </div>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Control Buttons */}
-      <div className="flex flex-wrap gap-3 mb-6">
-        {!isLoading ? (
-          <button
-            onClick={handleFetch}
-            className="flex items-center gap-2 px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium"
-          >
-            <Play className="h-4 w-4" />
-            Start Batch Fetch
-          </button>
-        ) : (
-          <div className="flex gap-2">
-            {!isPaused ? (
-              <button
-                onClick={handlePause}
-                className="flex items-center gap-2 px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700"
-              >
-                <Pause className="h-4 w-4" />
-                Pause
-              </button>
-            ) : (
-              <button
-                onClick={handleResume}
-                className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
-              >
-                <Play className="h-4 w-4" />
-                Resume
-              </button>
-            )}
-            <button
-              onClick={handleStop}
-              className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
-            >
-              <Square className="h-4 w-4" />
-              Stop
-            </button>
-          </div>
-        )}
-      </div>
-
       {/* Progress Section */}
       {isLoading && (
-        <div className="mb-6 p-4 bg-blue-50 rounded-lg">
-          <div className="flex items-center justify-between mb-2">
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+          <div className="flex justify-between items-center mb-2">
             <h3 className="font-medium text-blue-900">
               {isPaused ? 'Paused' : 'Fetching Market Cap Data...'}
             </h3>
@@ -602,7 +605,8 @@ const MarketCapForm: React.FC = () => {
               )}
             </div>
             <p className="text-sm text-green-700 mt-2">
-              CSV format: Tickers as rows, years as columns (pivot table ready). Prices are split and dividend-adjusted for accurate historical analysis.
+              CSV format: Tickers as rows, years as columns (pivot table ready). 
+              Prices are split and dividend-adjusted for accurate historical analysis.
             </p>
           </div>
 
