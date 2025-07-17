@@ -10,11 +10,6 @@ interface EODHDPriceData {
   volume: number;
 }
 
-interface EODHDSharesData {
-  date: string;
-  shares_outstanding: number;
-}
-
 interface MarketCapResult {
   ticker: string;
   date: string;
@@ -29,22 +24,11 @@ interface MarketCapResult {
 
 export async function POST(request: NextRequest) {
   try {
-    // DEBUG LOGGING - Add these lines to see what's happening
-    console.log('=== API ROUTE DEBUG START ===');
-    console.log('Environment check:');
-    console.log('- EODHD_API_TOKEN exists:', !!process.env.EODHD_API_TOKEN);
-    console.log('- Token length:', process.env.EODHD_API_TOKEN?.length || 0);
-    console.log('- Token preview:', process.env.EODHD_API_TOKEN?.substring(0, 10) + '...');
-
     const requestBody = await request.json();
-    console.log('Request body:', requestBody);
-
     const { ticker, date } = requestBody;
-    console.log('Parsed ticker:', ticker);
-    console.log('Parsed date:', date);
     
     if (!ticker || !date) {
-      console.log('❌ Missing ticker or date');
+      console.log('❌ Missing required fields:', { ticker: !!ticker, date: !!date });
       return NextResponse.json(
         { error: 'Ticker and date are required' },
         { status: 400 }
@@ -53,35 +37,28 @@ export async function POST(request: NextRequest) {
 
     const apiToken = process.env.EODHD_API_TOKEN;
     if (!apiToken) {
-      console.log('❌ No API token found in environment');
+      console.error('❌ EODHD_API_TOKEN environment variable not configured');
       return NextResponse.json(
         { error: 'EODHD API token not configured' },
         { status: 500 }
       );
     }
 
-    // Ensure ticker has .US suffix for US stocks
     const formattedTicker = ticker.includes('.') ? ticker : `${ticker}.US`;
-    console.log('Formatted ticker:', formattedTicker);
     
-    // Get split-adjusted price data
-    console.log('🔄 Calling getSplitAdjustedPrice...');
-    const priceData = await getSplitAdjustedPrice(formattedTicker, date, apiToken);
-    console.log('✅ Price data received:', priceData);
+    // Get split-adjusted price data with fallback logic
+    const priceData = await getSplitAdjustedPriceWithFallback(formattedTicker, date, apiToken);
     
     if (!priceData) {
-      console.log('❌ No price data returned');
-      throw new Error(`No price data available for ${formattedTicker} on ${date}`);
+      console.log(`❌ No price data found for ${formattedTicker} around ${date}`);
+      throw new Error(`No price data available for ${formattedTicker} around ${date}`);
     }
 
-    // Get shares outstanding (try historical first, fall back to defaults)
-    console.log('🔄 Getting shares outstanding...');
+    // Get shares outstanding
     let sharesOutstanding = await getSharesOutstanding(formattedTicker, date, apiToken);
     if (!sharesOutstanding) {
-      console.log('📊 Using default shares outstanding');
       sharesOutstanding = getDefaultSharesOutstanding(formattedTicker);
     }
-    console.log('Shares outstanding:', sharesOutstanding);
 
     // Calculate market cap
     const rawPrice = priceData.close;
@@ -91,7 +68,7 @@ export async function POST(request: NextRequest) {
 
     const result: MarketCapResult = {
       ticker: formattedTicker,
-      date: priceData.date,
+      date: priceData.date, // Use actual date found
       price: rawPrice,
       adjusted_price: adjustedPrice,
       shares_outstanding: sharesOutstanding,
@@ -103,16 +80,14 @@ export async function POST(request: NextRequest) {
         undefined
     };
 
-    console.log('✅ Final result:', result);
-    console.log('=== API ROUTE DEBUG END ===');
+    // Log successful requests (useful for monitoring)
+    console.log(`✅ Success: ${formattedTicker} (${date} → ${priceData.date}) - $${marketCapBillions.toFixed(1)}B`);
     return NextResponse.json(result);
     
   } catch (error) {
-    console.error('❌ API ROUTE ERROR:', error);
-    console.error('Error details:', {
-      name: error instanceof Error ? error.name : 'Unknown',
+    console.error('❌ API Error:', {
       message: error instanceof Error ? error.message : 'Unknown error',
-      stack: error instanceof Error ? error.stack : 'No stack trace'
+      timestamp: new Date().toISOString()
     });
     
     const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
@@ -123,67 +98,101 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// Get split-adjusted historical price
-async function getSplitAdjustedPrice(ticker: string, date: string, apiToken: string): Promise<EODHDPriceData> {
+// Enhanced price fetching with fallback logic for holidays/weekends
+async function getSplitAdjustedPriceWithFallback(ticker: string, requestedDate: string, apiToken: string): Promise<EODHDPriceData | null> {
+  // Try the exact date first
   try {
-    console.log(`🔄 Fetching price for ${ticker} on ${date}`);
-    
-    // Method 1: Use EOD API with focus on adjusted_close
-    const eodUrl = `https://eodhd.com/api/eod/${ticker}?from=${date}&to=${date}&api_token=${apiToken}&fmt=json`;
-    console.log('📡 API URL:', eodUrl.replace(apiToken, 'TOKEN_HIDDEN'));
-    
-    const response = await fetch(eodUrl);
-    console.log('📡 Response status:', response.status, response.statusText);
-    
-    if (!response.ok) {
-      throw new Error(`EODHD EOD API responded with status: ${response.status} - ${response.statusText}`);
+    const exactData = await tryFetchPriceForDate(ticker, requestedDate, apiToken);
+    if (exactData) {
+      return exactData;
     }
-    
-    const data = await response.json();
-    console.log('📡 Raw API response:', data);
-    
-    const dayData = Array.isArray(data) ? data[0] : data;
-    
-    if (!dayData || !dayData.adjusted_close) {
-      throw new Error(`No price data found for ${ticker} on ${date}`);
-    }
-    
-    console.log('✅ Parsed day data:', dayData);
-    
-    return {
-      date: dayData.date,
-      open: dayData.open,
-      high: dayData.high,
-      low: dayData.low,
-      close: dayData.close,
-      adjusted_close: dayData.adjusted_close,
-      volume: dayData.volume
-    };
-    
   } catch (error) {
-    console.error(`❌ Error fetching price for ${ticker} on ${date}:`, error);
-    throw error;
+    // Log API errors but continue to fallback dates
+    if (error instanceof Error && !error.message.includes('No data')) {
+      console.log(`⚠️ API error for ${ticker} on ${requestedDate}:`, error.message);
+    }
   }
+
+  // If exact date fails, try nearby dates (common for holidays/weekends)
+  const fallbackDates = generateFallbackDates(requestedDate);
+  
+  for (const fallbackDate of fallbackDates) {
+    try {
+      const fallbackData = await tryFetchPriceForDate(ticker, fallbackDate, apiToken);
+      if (fallbackData) {
+        console.log(`📅 Used fallback date for ${ticker}: ${requestedDate} → ${fallbackDate}`);
+        return fallbackData;
+      }
+    } catch (error) {
+      // Continue to next fallback date
+      continue;
+    }
+  }
+
+  return null;
+}
+
+// Generate fallback dates (try 1-5 days after the requested date)
+function generateFallbackDates(dateStr: string): string[] {
+  const baseDate = new Date(dateStr);
+  const fallbackDates: string[] = [];
+  
+  // Try the next 5 days
+  for (let i = 1; i <= 5; i++) {
+    const nextDate = new Date(baseDate);
+    nextDate.setDate(baseDate.getDate() + i);
+    fallbackDates.push(nextDate.toISOString().split('T')[0]);
+  }
+  
+  return fallbackDates;
+}
+
+// Try to fetch price data for a specific date
+async function tryFetchPriceForDate(ticker: string, date: string, apiToken: string): Promise<EODHDPriceData | null> {
+  const eodUrl = `https://eodhd.com/api/eod/${ticker}?from=${date}&to=${date}&api_token=${apiToken}&fmt=json`;
+  
+  const response = await fetch(eodUrl);
+  
+  if (!response.ok) {
+    throw new Error(`EODHD API error: ${response.status} ${response.statusText}`);
+  }
+  
+  const data = await response.json();
+  
+  // Check if we got data
+  if (!data || (Array.isArray(data) && data.length === 0)) {
+    return null; // No data for this date
+  }
+  
+  const dayData = Array.isArray(data) ? data[0] : data;
+  
+  if (!dayData || !dayData.adjusted_close) {
+    return null;
+  }
+  
+  return {
+    date: dayData.date,
+    open: dayData.open,
+    high: dayData.high,
+    low: dayData.low,
+    close: dayData.close,
+    adjusted_close: dayData.adjusted_close,
+    volume: dayData.volume
+  };
 }
 
 // Get historical shares outstanding
 async function getSharesOutstanding(ticker: string, date: string, apiToken: string): Promise<number | null> {
   try {
-    console.log(`🔄 Attempting to fetch shares outstanding for ${ticker}`);
-    
-    // Try fundamentals API for shares outstanding
-    const year = new Date(date).getFullYear();
     const fundamentalsUrl = `https://eodhd.com/api/fundamentals/${ticker}?api_token=${apiToken}&fmt=json`;
     
     const response = await fetch(fundamentalsUrl);
     if (!response.ok) {
-      console.log(`📊 Fundamentals API failed for ${ticker} (${response.status}), using defaults`);
       return null;
     }
     
     const data = await response.json();
     
-    // Try to get shares outstanding from various sources in the fundamentals data
     const sharesOutstanding = 
       data?.SharesStats?.SharesOutstanding ||
       data?.Highlights?.SharesOutstanding ||
@@ -192,25 +201,20 @@ async function getSharesOutstanding(ticker: string, date: string, apiToken: stri
       data?.outstandingShares;
 
     if (sharesOutstanding && sharesOutstanding > 0) {
-      console.log(`✅ Found shares outstanding from API: ${sharesOutstanding}`);
       return sharesOutstanding;
     }
     
-    console.log(`📊 No shares outstanding found in fundamentals for ${ticker}`);
     return null;
     
   } catch (error) {
-    console.log(`📊 Failed to fetch shares outstanding for ${ticker}:`, error);
+    // Silently fail - we'll use defaults
     return null;
   }
 }
 
-// Default shares outstanding for major companies (as fallback)
+// Default shares outstanding for major companies
 function getDefaultSharesOutstanding(ticker: string): number {
-  console.log(`📊 Using default shares outstanding for ${ticker}`);
-  
   const defaultShares: { [key: string]: number } = {
-    // FAANG/Tech Giants
     'AAPL.US': 15400000000,   // Apple
     'MSFT.US': 7400000000,    // Microsoft
     'GOOGL.US': 1240000000,   // Alphabet Class A
@@ -220,8 +224,6 @@ function getDefaultSharesOutstanding(ticker: string): number {
     'TSLA.US': 3200000000,    // Tesla
     'NFLX.US': 440000000,     // Netflix
     'NVDA.US': 2500000000,    // NVIDIA
-    
-    // Other Major Tech
     'CRM.US': 1000000000,     // Salesforce
     'ORCL.US': 2700000000,    // Oracle
     'ADBE.US': 460000000,     // Adobe
@@ -230,8 +232,6 @@ function getDefaultSharesOutstanding(ticker: string): number {
     'CSCO.US': 4200000000,    // Cisco
     'IBM.US': 920000000,      // IBM
     'SHOP.US': 1300000000,    // Shopify
-    
-    // Financial Services
     'V.US': 2100000000,       // Visa
     'MA.US': 970000000,       // Mastercard
     'JPM.US': 2900000000,     // JPMorgan Chase
@@ -242,8 +242,6 @@ function getDefaultSharesOutstanding(ticker: string): number {
     'AXP.US': 740000000,      // American Express
     'PYPL.US': 1100000000,    // PayPal
     'SQ.US': 610000000,       // Block (Square)
-    
-    // Healthcare & Pharma
     'UNH.US': 930000000,      // UnitedHealth
     'JNJ.US': 2600000000,     // Johnson & Johnson
     'PFE.US': 5600000000,     // Pfizer
@@ -260,8 +258,6 @@ function getDefaultSharesOutstanding(ticker: string): number {
     'VRTX.US': 260000000,     // Vertex Pharmaceuticals
     'BIIB.US': 150000000,     // Biogen
     'ISRG.US': 360000000,     // Intuitive Surgical
-    
-    // Consumer & Retail
     'WMT.US': 2700000000,     // Walmart
     'HD.US': 1000000000,      // Home Depot
     'COST.US': 440000000,     // Costco
@@ -271,8 +267,6 @@ function getDefaultSharesOutstanding(ticker: string): number {
     'SBUX.US': 1100000000,    // Starbucks
     'MCD.US': 740000000,      // McDonald's
     'DIS.US': 1800000000,     // Disney
-    
-    // Consumer Goods
     'PG.US': 2400000000,      // Procter & Gamble
     'KO.US': 4300000000,      // Coca-Cola
     'PEP.US': 1400000000,     // PepsiCo
@@ -280,15 +274,11 @@ function getDefaultSharesOutstanding(ticker: string): number {
     'KMB.US': 340000000,      // Kimberly-Clark
     'GIS.US': 600000000,      // General Mills
     'K.US': 340000000,        // Kellogg
-    
-    // Energy
     'XOM.US': 4200000000,     // ExxonMobil
     'CVX.US': 1900000000,     // Chevron
     'COP.US': 1300000000,     // ConocoPhillips
     'EOG.US': 580000000,      // EOG Resources
     'SLB.US': 1400000000,     // Schlumberger
-    
-    // Semiconductors
     'TSM.US': 5200000000,     // Taiwan Semiconductor
     'AVGO.US': 460000000,     // Broadcom
     'TXN.US': 900000000,      // Texas Instruments
@@ -302,8 +292,6 @@ function getDefaultSharesOutstanding(ticker: string): number {
     'KLA.US': 140000000,      // KLA Corporation
     'SNPS.US': 150000000,     // Synopsys
     'CDNS.US': 140000000,     // Cadence Design Systems
-    
-    // Industrials
     'HON.US': 680000000,      // Honeywell
     'UPS.US': 870000000,      // UPS
     'CAT.US': 510000000,      // Caterpillar
@@ -314,66 +302,11 @@ function getDefaultSharesOutstanding(ticker: string): number {
     'RTX.US': 1500000000,     // Raytheon Technologies
     'BA.US': 590000000,       // Boeing
     'NOC.US': 160000000,      // Northrop Grumman
-    'LHX.US': 420000000,      // L3Harris Technologies
-    
-    // Cybersecurity & Cloud
-    'PANW.US': 330000000,     // Palo Alto Networks
-    'FTNT.US': 800000000,     // Fortinet
-    'CRWD.US': 240000000,     // CrowdStrike
-    'ZS.US': 140000000,       // Zscaler
-    'OKTA.US': 170000000,     // Okta
-    'NET.US': 330000000,      // Cloudflare
-    'DDOG.US': 340000000,     // Datadog
-    'SNOW.US': 340000000,     // Snowflake
-    'PLTR.US': 2200000000,    // Palantir
-    'S.US': 120000000,        // SentinelOne
-    
-    // Transportation & Logistics
-    'UBER.US': 2000000000,    // Uber
-    'LYFT.US': 380000000,     // Lyft
-    'ABNB.US': 640000000,     // Airbnb
-    'DASH.US': 380000000,     // DoorDash
-    'FDX.US': 260000000,      // FedEx
-    
-    // Gaming & Entertainment
-    'RBLX.US': 580000000,     // Roblox
-    'EA.US': 280000000,       // Electronic Arts
-    'ATVI.US': 780000000,     // Activision Blizzard
-    'TTWO.US': 110000000,     // Take-Two Interactive
-    
-    // Fintech & Crypto
-    'COIN.US': 260000000,     // Coinbase
-    'HOOD.US': 880000000,     // Robinhood
-    'SOFI.US': 920000000,     // SoFi Technologies
-    'UPST.US': 850000000,     // Upstart
-    'AFRM.US': 300000000,     // Affirm
-    
-    // Biotech
-    'MRNA.US': 380000000,     // Moderna
-    'BNTX.US': 240000000,     // BioNTech
-    'NVAX.US': 780000000,     // Novavax
-    
-    // REITs
-    'AMT.US': 450000000,      // American Tower
-    'CCI.US': 470000000,      // Crown Castle
-    'EQIX.US': 90000000,      // Equinix
-    'PLD.US': 770000000,      // Prologis
-    'SPG.US': 310000000,      // Simon Property Group
-    
-    // Communications
-    'VZ.US': 4200000000,      // Verizon
-    'T.US': 7200000000,       // AT&T
-    'TMUS.US': 1300000000,    // T-Mobile
-    'CHTR.US': 160000000,     // Charter Communications
-    'CMCSA.US': 4500000000,   // Comcast
   };
   
-  const shares = defaultShares[ticker] || 1000000000; // 1B shares as ultimate fallback
-  console.log(`📊 Default shares for ${ticker}: ${shares.toLocaleString()}`);
-  return shares;
+  return defaultShares[ticker] || 1000000000; // 1B shares as fallback
 }
 
-// Handle CORS if needed
 export async function OPTIONS(request: NextRequest) {
   return new Response(null, {
     status: 200,
